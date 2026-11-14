@@ -87,6 +87,21 @@ ul.list{list-style:none;padding:0;margin:14px 0 0;display:flex;flex-direction:co
   }
   const unseal = async (key, u8) => new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u8.subarray(0, 12) }, key, u8.subarray(12)));
 
+  const pipeBytes = async (u8, t) => new Uint8Array(await new Response(new Blob([u8]).stream().pipeThrough(t)).arrayBuffer());
+  const zip = (u8) => pipeBytes(u8, new CompressionStream('deflate-raw'));
+  const unzip = (u8) => pipeBytes(u8, new DecompressionStream('deflate-raw'));
+
+  // ---------- direct (peer-to-peer) path ----------
+  const ICE = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
+  const CHUNK = 64 * 1024, HIGH_WATER = 8 * 1024 * 1024;
+  function iceDone(pc) {
+    return new Promise((r) => {
+      if (pc.iceGatheringState === 'complete') return r();
+      const t = setTimeout(r, 2500);
+      pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); r(); } });
+    });
+  }
+
   async function encryptFile(key, file) {
     const parts = [];
     for (let off = 0; off < file.size || (off === 0 && parts.length === 0); off += RECORD) {
@@ -143,17 +158,92 @@ ul.list{list-style:none;padding:0;margin:14px 0 0;display:flex;flex-direction:co
 
     async function post(obj) {
       await keyReady;
-      const body = b64(await seal(key, enc.encode(JSON.stringify({ ...obj, from: me, role }))));
+      const body = b64(await seal(key, await zip(enc.encode(JSON.stringify({ ...obj, from: me, role })))));
       const r = await fetch('https://' + NTFY + '/' + sessionId, { method: 'POST', body });
       if (!r.ok) throw new Error('signal ' + r.status);
     }
-    function markConnected() { if (!connected) { connected = true; h.onConnected && h.onConnected(); } }
+    let dc = null, rpc = null, mode = 'relay';
+    const setMode = (m) => { if (mode !== m) { mode = m; h.onMode && h.onMode(m); } };
+    function markConnected() {
+      if (!connected) { connected = true; h.onConnected && h.onConnected(); h.onMode && h.onMode(mode); }
+      if (role === 'phone' && !rpc) startDirect();
+    }
+
+    // Phone offers, computer answers; the handshake rides the encrypted relay channel.
+    function newPc() {
+      try { rpc && rpc.close(); } catch {}
+      const pc = (rpc = new RTCPeerConnection({ iceServers: ICE }));
+      pc.addEventListener('connectionstatechange', () => {
+        if (['failed', 'closed', 'disconnected'].includes(pc.connectionState) && rpc === pc) { dc = null; setMode('relay'); }
+      });
+      return pc;
+    }
+    function useChannel(ch) {
+      ch.binaryType = 'arraybuffer';
+      const incoming = {};
+      ch.onopen = () => { dc = ch; setMode('direct'); };
+      ch.onclose = () => { if (dc === ch) { dc = null; setMode('relay'); } };
+      ch.onmessage = (e) => {
+        if (typeof e.data === 'string') {
+          const m = JSON.parse(e.data);
+          if (m.k === 'text') h.onText && h.onText(m.t);
+          else if (m.k === 'meta') { incoming[m.id] = { m, parts: [], got: 0 }; h.onFileStart && h.onFileStart(m.id, m); }
+          else if (m.k === 'end') {
+            const f = incoming[m.id]; if (!f) return; delete incoming[m.id];
+            h.onFile && h.onFile(m.id, new File(f.parts, f.m.name, { type: f.m.type || 'application/octet-stream' }));
+          }
+        } else {
+          const id = dec.decode(new Uint8Array(e.data, 0, 34)); const f = incoming[id]; if (!f) return;
+          const d = e.data.slice(34); f.parts.push(d); f.got += d.byteLength;
+          h.onProgress && h.onProgress(id, f.m.size ? f.got / f.m.size : 1);
+        }
+      };
+      if (ch.readyState === 'open') ch.onopen();
+    }
+    async function startDirect() {
+      try {
+        const pc = newPc();
+        useChannel(pc.createDataChannel('qrdrop', { ordered: true }));
+        await pc.setLocalDescription(await pc.createOffer());
+        await iceDone(pc);
+        await post({ k: 'rtc-offer', sdp: pc.localDescription });
+      } catch (e) { console.warn('direct failed', e); }
+    }
+    async function onOffer(sdp) {
+      const pc = newPc();
+      pc.ondatachannel = (e) => useChannel(e.channel);
+      await pc.setRemoteDescription(sdp);
+      await pc.setLocalDescription(await pc.createAnswer());
+      await iceDone(pc);
+      await post({ k: 'rtc-answer', sdp: pc.localDescription });
+    }
+    async function sendDirect(file, id) {
+      const ch = dc;
+      ch.send(JSON.stringify({ k: 'meta', id, name: file.name, size: file.size, type: file.type }));
+      const head = enc.encode(id);
+      for (let off = 0; off < file.size;) {
+        const slice = new Uint8Array(await file.slice(off, off + CHUNK * 16).arrayBuffer());
+        for (let i = 0; i < slice.length; i += CHUNK) {
+          while (ch.bufferedAmount > HIGH_WATER) {
+            if (ch.readyState !== 'open') throw new Error('direct link dropped');
+            await new Promise((r) => setTimeout(r, 10));
+          }
+          const part = slice.subarray(i, i + CHUNK), b = new Uint8Array(34 + part.length);
+          b.set(head); b.set(part, 34); ch.send(b);
+        }
+        off += slice.length;
+        h.onSendProgress && h.onSendProgress(id, off / file.size);
+      }
+      ch.send(JSON.stringify({ k: 'end', id }));
+    }
 
     async function handle(m) {
       if (m.from === me || m.role === role) return;
       if (m.k === 'hello') { markConnected(); post({ k: 'here' }); }
       else if (m.k === 'here') markConnected();
-      else if (m.k === 'bye') { connected = false; h.onDisconnected && h.onDisconnected(); }
+      else if (m.k === 'rtc-offer' && role === 'pc') { markConnected(); onOffer(m.sdp).catch((e) => console.warn(e)); }
+      else if (m.k === 'rtc-answer' && role === 'phone' && rpc && !rpc.remoteDescription) rpc.setRemoteDescription(m.sdp).catch((e) => console.warn(e));
+      else if (m.k === 'bye') { connected = false; dc = null; try { rpc && rpc.close(); } catch {} rpc = null; mode = 'relay'; h.onDisconnected && h.onDisconnected(); }
       else if (m.k === 'text') { markConnected(); h.onText && h.onText(m.t); }
       else if (m.k === 'file') {
         markConnected();
@@ -172,7 +262,7 @@ ul.list{list-style:none;padding:0;margin:14px 0 0;display:flex;flex-direction:co
         const d = JSON.parse(e.data);
         if (d.event === 'open') { firstOpen(); return; }
         if (d.event !== 'message') return;
-        let m; try { await keyReady; m = JSON.parse(dec.decode(await unseal(key, unb64(d.message)))); } catch { return; } // not ours
+        let m; try { await keyReady; m = JSON.parse(dec.decode(await unzip(await unseal(key, unb64(d.message))))); } catch { return; } // not ours
         handle(m);
       };
       ws.onclose = () => { if (!closed) setTimeout(sub, 2000); };
@@ -185,6 +275,10 @@ ul.list{list-style:none;padding:0;margin:14px 0 0;display:flex;flex-direction:co
       const path = 'qd' + hex(16);
       if (!isText) h.onSendStart && h.onSendStart(path, file);
       queue = queue.then(async () => {
+        if (dc && dc.readyState === 'open' && !isText) {
+          try { await sendDirect(file, path); h.onSendDone && h.onSendDone(path); return; }
+          catch (e) { if (file.size > 0) h.onSendProgress && h.onSendProgress(path, 0); } // fall through to relay
+        }
         await post({ k: 'file', path, name: file.name, size: file.size, type: file.type, isText: !!isText });
         const blob = await encryptFile(key, file);
         await upload(path, blob, (p) => !isText && h.onSendProgress && h.onSendProgress(path, p));
@@ -193,12 +287,13 @@ ul.list{list-style:none;padding:0;margin:14px 0 0;display:flex;flex-direction:co
       return path;
     }
     function sendText(t) {
+      if (dc && dc.readyState === 'open' && t.length < 60000) { queue = queue.then(() => dc.send(JSON.stringify({ k: 'text', t }))).catch(() => {}); return; }
       if (t.length > MAX_INLINE_TEXT) return sendFile(new File([t], 'text.txt', { type: 'text/plain' }), true);
       queue = queue.then(() => post({ k: 'text', t })).catch((e) => h.onError && h.onError('Sending text failed: ' + e.message));
     }
-    function close() { closed = true; try { navigator.sendBeacon && keyHex && post({ k: 'bye' }); } catch {} try { ws.close(); } catch {} }
+    function close() { closed = true; try { navigator.sendBeacon && keyHex && post({ k: 'bye' }); } catch {} try { ws.close(); } catch {} try { rpc && rpc.close(); } catch {} }
 
-    return { ready, sendFile, sendText, close, get connected() { return connected; } };
+    return { ready, sendFile, sendText, close, get connected() { return connected; }, get mode() { return mode; } };
   }
 
   function fmtSize(b) { const u = ['B', 'KB', 'MB', 'GB']; let i = 0; while (b >= 1024 && i < 3) { b /= 1024; i++; } return (i ? b.toFixed(1) : b) + ' ' + u[i]; }
@@ -273,6 +368,7 @@ function start() {
   setStatus('Connecting to computer…');
   sess = QRLink.session(id, key, 'phone', {
     onConnected: () => setStatus('Connected', 'on'),
+    onMode: (m) => setStatus(m === 'direct' ? 'Connected · Direct ⚡' : 'Connected · via relay', 'on'),
     onDisconnected: () => setStatus('Computer closed the session', 'off'),
     onText: clearEmptyAdd((t) => addTextItem($('#list'), t, 'in')),
     onFileStart: clearEmptyAdd((pid, m) => addFileItem($('#list'), pid, m, 'in')),
