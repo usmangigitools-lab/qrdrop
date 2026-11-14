@@ -63,12 +63,128 @@ ul.list{list-style:none;padding:0;margin:14px 0 0;display:flex;flex-direction:co
   </div>
   <p class="hint">Keep this page open while transferring. Data goes directly between your phone and computer.</p>
 </div>
-<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
 <script>
+// Minimal WebRTC link. The handshake goes through ntfy.sh (a free public relay, only ~2 small
+// messages per connection). After that, all data flows directly between the two devices.
+(function (global) {
+  const NTFY = 'ntfy.sh';
+  const ICE = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
+
+  const rand = (n = 12) => Array.from(crypto.getRandomValues(new Uint8Array(n)), (b) => b.toString(16).padStart(2, '0')).join('');
+
+  async function pack(o) {
+    const s = new Blob([JSON.stringify(o)]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+    const b = new Uint8Array(await new Response(s).arrayBuffer());
+    let str = ''; for (const x of b) str += String.fromCharCode(x);
+    return btoa(str);
+  }
+  async function unpack(t) {
+    const b = Uint8Array.from(atob(t), (c) => c.charCodeAt(0));
+    const s = new Blob([b]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return JSON.parse(await new Response(s).text());
+  }
+  async function publish(topic, o) {
+    const r = await fetch('https://' + NTFY + '/' + topic, { method: 'POST', body: await pack(o) });
+    if (!r.ok) throw new Error('signal publish failed ' + r.status);
+  }
+  function subscribe(topic, onMsg) {
+    let ws, closed = false, first;
+    const ready = new Promise((r) => (first = r));
+    const open = () => {
+      ws = new WebSocket('wss://' + NTFY + '/' + topic + '/ws');
+      ws.onmessage = async (e) => {
+        const d = JSON.parse(e.data);
+        if (d.event === 'open') first();
+        if (d.event === 'message') { try { onMsg(await unpack(d.message)); } catch (err) { console.warn(err); } }
+      };
+      ws.onclose = () => { if (!closed) setTimeout(open, 2000); };
+    };
+    open();
+    return { ready, close() { closed = true; try { ws.close(); } catch {} } };
+  }
+  function iceDone(pc) {
+    return new Promise((r) => {
+      if (pc.iceGatheringState === 'complete') return r();
+      const t = setTimeout(r, 3000);
+      pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); r(); } });
+    });
+  }
+
+  // Wrap an RTCDataChannel in the small API transfer.js expects.
+  // Control messages go as JSON; file chunks go as binary with an 8-byte id header.
+  function wrapChannel(dc, pc) {
+    dc.binaryType = 'arraybuffer';
+    const h = { data: [], open: [], close: [] };
+    const enc = new TextEncoder(), dec = new TextDecoder();
+    let fired = false;
+    const conn = {
+      dataChannel: dc, open: false,
+      on(ev, f) { h[ev].push(f); if (ev === 'open' && conn.open) setTimeout(f); },
+      send(m) {
+        if (m.t === 'chunk') {
+          const b = new Uint8Array(8 + m.d.byteLength);
+          b.set(enc.encode(m.id.slice(0, 8))); b.set(new Uint8Array(m.d), 8);
+          dc.send(b.buffer);
+        } else dc.send(JSON.stringify(m));
+      },
+      close() { try { dc.close(); } catch {} try { pc.close(); } catch {} },
+    };
+    const onOpen = () => { conn.open = true; h.open.forEach((f) => f()); };
+    const onClose = () => { if (fired) return; fired = true; conn.open = false; h.close.forEach((f) => f()); };
+    dc.onopen = onOpen; dc.onclose = onClose;
+    pc.addEventListener('connectionstatechange', () => { if (['failed', 'closed'].includes(pc.connectionState)) onClose(); });
+    if (dc.readyState === 'open') setTimeout(onOpen);
+    dc.onmessage = (e) => {
+      let m;
+      if (typeof e.data === 'string') m = JSON.parse(e.data);
+      else { const u = new Uint8Array(e.data); m = { t: 'chunk', id: dec.decode(u.subarray(0, 8)), d: e.data.slice(8) }; }
+      h.data.forEach((f) => f(m));
+    };
+    return conn;
+  }
+
+  // Computer side: wait for a phone to call in on this session id.
+  function host(topic, onConn) {
+    let pc;
+    const sub = subscribe(topic, async (m) => {
+      if (m.k !== 'offer') return;
+      if (pc) try { pc.close(); } catch {}
+      const mine = (pc = new RTCPeerConnection({ iceServers: ICE }));
+      mine.ondatachannel = (e) => onConn(wrapChannel(e.channel, mine));
+      await mine.setRemoteDescription(m.sdp);
+      await mine.setLocalDescription(await mine.createAnswer());
+      await iceDone(mine);
+      await publish(topic, { k: 'answer', to: m.from, sdp: mine.localDescription });
+    });
+    return { ready: sub.ready, close() { sub.close(); try { pc && pc.close(); } catch {} } };
+  }
+
+  // Phone side: call the computer. onFail fires if no connection within 20 s.
+  function join(topic, onFail) {
+    const me = rand(6);
+    const pc = new RTCPeerConnection({ iceServers: ICE });
+    const conn = wrapChannel(pc.createDataChannel('qrdrop', { ordered: true }), pc);
+    const sub = subscribe(topic, async (m) => {
+      if (m.k === 'answer' && m.to === me && !pc.remoteDescription) { await pc.setRemoteDescription(m.sdp); sub.close(); }
+    });
+    (async () => {
+      await sub.ready;
+      await pc.setLocalDescription(await pc.createOffer());
+      await iceDone(pc);
+      await publish(topic, { k: 'offer', from: me, sdp: pc.localDescription });
+    })().catch((e) => { console.warn(e); onFail && onFail('signal'); });
+    const t = setTimeout(() => { if (!conn.open) { sub.close(); try { pc.close(); } catch {} onFail && onFail('timeout'); } }, 20000);
+    conn.on('open', () => clearTimeout(t));
+    return conn;
+  }
+
+  global.RTCLink = { host, join, rand };
+})(window);
+
 // Shared P2P transfer engine (used by the extension and the phone page).
 // Files are sent in small chunks with backpressure so large files stream smoothly.
 (function (global) {
-  const CHUNK = 16 * 1024;          // fits a single WebRTC message
+  const CHUNK = 64 * 1024;          // one WebRTC message
   const HIGH_WATER = 4 * 1024 * 1024; // pause sending when 4 MB is queued
 
   function makeTransfer(conn, h) {
@@ -90,17 +206,17 @@ ul.list{list-style:none;padding:0;margin:14px 0 0;display:flex;flex-direction:co
       }
     });
 
-    const busy = () => (conn.dataChannel ? conn.dataChannel.bufferedAmount : 0) + (conn.bufferSize || 0) * CHUNK > HIGH_WATER;
+    const busy = () => conn.dataChannel.bufferedAmount > HIGH_WATER;
     const drain = () => new Promise((r) => { const tick = () => (busy() ? setTimeout(tick, 15) : r()); tick(); });
 
     let queue = Promise.resolve();
     function sendFile(file, onSendProgress) {
-      const id = Math.random().toString(36).slice(2, 10);
+      const id = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) => b.toString(16).padStart(2, '0')).join(''); // 8 chars
       queue = queue.then(async () => {
         conn.send({ t: 'meta', id, name: file.name, size: file.size, type: file.type });
         let off = 0;
         while (off < file.size) {
-          const slice = await file.slice(off, off + CHUNK * 64).arrayBuffer(); // read 1 MB at a time
+          const slice = await file.slice(off, off + CHUNK * 16).arrayBuffer(); // read 1 MB at a time
           for (let i = 0; i < slice.byteLength; i += CHUNK) {
             if (busy()) await drain();
             conn.send({ t: 'chunk', id, d: slice.slice(i, i + CHUNK) });
@@ -180,7 +296,7 @@ ul.list{list-style:none;padding:0;margin:14px 0 0;display:flex;flex-direction:co
 <script>
 const { $, addTextItem, addFileItem, progress, finishIncoming, finishOutgoing } = QRUI;
 const target = decodeURIComponent(location.hash.slice(1));
-let xfer, conn, peer;
+let xfer, conn;
 function setStatus(t, c) { const s = $('#status'); s.textContent = t; s.className = 'status ' + (c || ''); }
 function clearEmpty() { const e = document.querySelector('#list .empty'); if (e) e.remove(); }
 function setEnabled(on) { document.querySelectorAll('button, label.btn, input, textarea').forEach((e) => e.toggleAttribute('disabled', !on)); }
@@ -188,28 +304,22 @@ function setEnabled(on) { document.querySelectorAll('button, label.btn, input, t
 function connect() {
   if (!target) { setStatus('No session. Scan the QR code from your computer', 'off'); setEnabled(false); return; }
   setEnabled(false);
-  if (!peer || peer.destroyed) {
-    peer = new Peer({ debug: 0 });
-    peer.on('error', (e) => {
-      if (e.type === 'peer-unavailable') { setStatus('Computer session ended. Scan a new QR', 'off'); return; }
-      setStatus('Connection problem, retrying…', 'off'); try { peer.destroy(); } catch {} setTimeout(connect, 3000);
+  setStatus('Connecting to computer…');
+  const c = RTCLink.join(target, (why) => {
+    setStatus(why === 'timeout' ? 'Could not reach computer. Is the QR Drop tab open? Retrying…' : 'Connection problem. Retrying…', 'off');
+    setTimeout(connect, 3000);
+  });
+  conn = c;
+  c.on('open', () => {
+    setStatus('Connected', 'on'); setEnabled(true);
+    xfer = QRDrop.makeTransfer(c, {
+      onText: (t) => { clearEmpty(); addTextItem($('#list'), t, 'in'); },
+      onFileStart: (m) => { clearEmpty(); addFileItem($('#list'), m.id, m, 'in'); },
+      onProgress: progress,
+      onFile: (file, id) => finishIncoming(id, file),
     });
-  }
-  const go = () => {
-    setStatus('Connecting to computer…');
-    conn = peer.connect(target, { reliable: true });
-    conn.on('open', () => {
-      setStatus('Connected', 'on'); setEnabled(true);
-      xfer = QRDrop.makeTransfer(conn, {
-        onText: (t) => { clearEmpty(); addTextItem($('#list'), t, 'in'); },
-        onFileStart: (m) => { clearEmpty(); addFileItem($('#list'), m.id, m, 'in'); },
-        onProgress: progress,
-        onFile: (file, id) => finishIncoming(id, file),
-      });
-    });
-    conn.on('close', () => { xfer = null; setEnabled(false); setStatus('Disconnected, retrying…', 'off'); setTimeout(connect, 2000); });
-  };
-  if (peer.open) go(); else peer.once('open', go);
+  });
+  c.on('close', () => { if (conn !== c) return; xfer = null; setEnabled(false); setStatus('Disconnected. Reconnecting…', 'off'); setTimeout(connect, 2000); });
 }
 
 function sendFiles(list) {
