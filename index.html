@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>QR Drop</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--line:#2a2f3a;--fg:#e8eaf0;--mut:#8b93a5;--acc:#4f8cff;--ok:#3ccf8e;--warn:#f5a524}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:980px;margin:0 auto;padding:20px}
+h1{font-size:20px;margin:0}
+header{display:flex;align-items:center;gap:12px;justify-content:space-between;margin-bottom:16px}
+.status{display:inline-flex;align-items:center;gap:6px;color:var(--mut);font-size:13px}
+.status::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--warn)}
+.status.on::before{background:var(--ok)} .status.off::before{background:#e5484d}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+.grid{display:grid;grid-template-columns:300px 1fr;gap:16px}
+@media(max-width:760px){.grid{grid-template-columns:1fr}}
+#qr{background:#fff;border-radius:10px;padding:12px;display:flex;justify-content:center;min-height:250px;align-items:center;color:#333}
+#qr img,#qr svg{width:100%;height:auto;image-rendering:pixelated}
+.hint{color:var(--mut);font-size:12.5px;margin:10px 0 0}
+.btn{appearance:none;border:1px solid var(--line);background:#222733;color:var(--fg);padding:9px 14px;border-radius:9px;cursor:pointer;font:inherit;text-decoration:none;display:inline-block}
+.btn:hover{border-color:var(--acc)} .btn.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+.btn.sm{padding:5px 10px;font-size:12.5px} .btn:disabled{opacity:.45;cursor:not-allowed}
+textarea,input[type=text],input[type=url]{width:100%;background:#11141a;color:var(--fg);border:1px solid var(--line);border-radius:9px;padding:10px;font:inherit}
+textarea{min-height:80px;resize:vertical}
+.row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+.drop{border:2px dashed var(--line);border-radius:12px;padding:22px;text-align:center;color:var(--mut);cursor:pointer;margin-bottom:12px}
+.drop.over{border-color:var(--acc);color:var(--fg);background:#1b2233}
+ul.list{list-style:none;padding:0;margin:14px 0 0;display:flex;flex-direction:column;gap:8px}
+.item{display:flex;gap:10px;align-items:flex-start;background:#13161c;border:1px solid var(--line);border-radius:10px;padding:10px}
+.item .tag{font-size:11px;color:var(--mut);white-space:nowrap;padding-top:2px;min-width:52px}
+.item.in .tag{color:var(--ok)} .item.out .tag{color:var(--acc)}
+.item .body{flex:1;min-width:0}
+.item .name{font-weight:600;word-break:break-all} .item .meta{color:var(--mut);font-size:12px}
+.item pre.text{margin:0;white-space:pre-wrap;word-break:break-word;font:inherit;max-height:160px;overflow:auto}
+.item .acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.thumb{max-width:100%;max-height:180px;border-radius:8px;display:block;margin-bottom:6px}
+.bar{height:5px;background:#222733;border-radius:4px;margin-top:6px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .15s}
+.done{color:var(--ok);font-size:12.5px}
+.empty{color:var(--mut);text-align:center;padding:14px}
+.setup{max-width:560px;margin:40px auto}
+.code{font-family:ui-monospace,monospace;font-size:12px;color:var(--mut);word-break:break-all}
+</style>
+<style>
+  .wrap{padding:14px} .card{margin-bottom:12px}
+  .big{display:block;width:100%;padding:16px;font-size:16px;text-align:center;margin-bottom:8px}
+</style></head>
+<body><div class="wrap">
+  <header><h1>📲 QR Drop</h1><span id="status" class="status">Connecting…</span></header>
+
+  <div class="card">
+    <label class="btn primary big">📷 Send photos / videos<input id="media" type="file" accept="image/*,video/*" multiple hidden></label>
+    <label class="btn big">📁 Send files<input id="files" type="file" multiple hidden></label>
+    <textarea id="text" placeholder="Type or paste text to send to your computer…"></textarea>
+    <div class="row"><button id="sendText" class="btn primary">Send text</button></div>
+  </div>
+
+  <div class="card">
+    <b>Transfers</b>
+    <ul id="list" class="list"><li class="empty">Files and text from your computer appear here. Tap <b>Save</b> to download.</li></ul>
+  </div>
+  <p class="hint">Keep this page open while transferring. Data goes directly between your phone and computer.</p>
+</div>
+<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script>
+// Shared P2P transfer engine (used by the extension and the phone page).
+// Files are sent in small chunks with backpressure so large files stream smoothly.
+(function (global) {
+  const CHUNK = 16 * 1024;          // fits a single WebRTC message
+  const HIGH_WATER = 4 * 1024 * 1024; // pause sending when 4 MB is queued
+
+  function makeTransfer(conn, h) {
+    const incoming = {};
+    conn.on('data', (m) => {
+      if (!m || !m.t) return;
+      if (m.t === 'text') h.onText && h.onText(m.text);
+      else if (m.t === 'meta') {
+        incoming[m.id] = { ...m, parts: [], got: 0 };
+        h.onFileStart && h.onFileStart(m);
+      } else if (m.t === 'chunk') {
+        const f = incoming[m.id]; if (!f) return;
+        f.parts.push(m.d); f.got += m.d.byteLength;
+        h.onProgress && h.onProgress(m.id, f.size ? f.got / f.size : 1);
+      } else if (m.t === 'end') {
+        const f = incoming[m.id]; if (!f) return;
+        delete incoming[m.id];
+        h.onFile && h.onFile(new File(f.parts, f.name, { type: f.type || 'application/octet-stream' }), m.id);
+      }
+    });
+
+    const busy = () => (conn.dataChannel ? conn.dataChannel.bufferedAmount : 0) + (conn.bufferSize || 0) * CHUNK > HIGH_WATER;
+    const drain = () => new Promise((r) => { const tick = () => (busy() ? setTimeout(tick, 15) : r()); tick(); });
+
+    let queue = Promise.resolve();
+    function sendFile(file, onSendProgress) {
+      const id = Math.random().toString(36).slice(2, 10);
+      queue = queue.then(async () => {
+        conn.send({ t: 'meta', id, name: file.name, size: file.size, type: file.type });
+        let off = 0;
+        while (off < file.size) {
+          const slice = await file.slice(off, off + CHUNK * 64).arrayBuffer(); // read 1 MB at a time
+          for (let i = 0; i < slice.byteLength; i += CHUNK) {
+            if (busy()) await drain();
+            conn.send({ t: 'chunk', id, d: slice.slice(i, i + CHUNK) });
+          }
+          off += slice.byteLength;
+          onSendProgress && onSendProgress(id, off / file.size, file);
+        }
+        if (file.size === 0) onSendProgress && onSendProgress(id, 1, file);
+        conn.send({ t: 'end', id });
+      }).catch((e) => console.error(e));
+      return id;
+    }
+    function sendText(text) { queue = queue.then(() => conn.send({ t: 'text', text })); }
+    return { sendFile, sendText };
+  }
+
+  function fmtSize(b) {
+    const u = ['B', 'KB', 'MB', 'GB']; let i = 0;
+    while (b >= 1024 && i < 3) { b /= 1024; i++; }
+    return (i ? b.toFixed(1) : b) + ' ' + u[i];
+  }
+
+  global.QRDrop = { makeTransfer, fmtSize };
+})(window);
+
+// Shared UI helpers for the item list (both extension and phone page).
+(function (global) {
+  const $ = (s) => document.querySelector(s);
+  const items = {};
+
+  function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+
+  function addTextItem(list, text, dir) {
+    const li = el('li', 'item ' + dir);
+    li.append(el('span', 'tag', dir === 'in' ? '⬇ text' : '⬆ text'));
+    const body = el('div', 'body'); const p = el('pre', 'text', text); body.append(p);
+    const isUrl = /^https?:\/\/\S+$/.test(text.trim());
+    const acts = el('div', 'acts');
+    const copy = el('button', 'btn sm', 'Copy');
+    copy.onclick = async () => { try { await navigator.clipboard.writeText(text); } catch { const t = el('textarea'); t.value = text; document.body.append(t); t.select(); document.execCommand('copy'); t.remove(); } copy.textContent = 'Copied ✓'; setTimeout(() => (copy.textContent = 'Copy'), 1200); };
+    acts.append(copy);
+    if (isUrl) { const a = el('a', 'btn sm', 'Open'); a.href = text.trim(); a.target = '_blank'; a.rel = 'noopener'; acts.append(a); }
+    li.append(body, acts); list.prepend(li);
+  }
+
+  function addFileItem(list, id, meta, dir) {
+    const li = el('li', 'item ' + dir);
+    li.append(el('span', 'tag', dir === 'in' ? '⬇ file' : '⬆ file'));
+    const body = el('div', 'body');
+    body.append(el('div', 'name', meta.name), el('div', 'meta', QRDrop.fmtSize(meta.size)));
+    const bar = el('div', 'bar'); const fill = el('i'); bar.append(fill); body.append(bar);
+    const acts = el('div', 'acts');
+    li.append(body, acts); list.prepend(li);
+    items[id] = { li, fill, body, acts };
+  }
+
+  function progress(id, p) { const it = items[id]; if (it) it.fill.style.width = Math.round(p * 100) + '%'; }
+
+  function finishIncoming(id, file) {
+    const it = items[id]; if (!it) return;
+    it.li.querySelector('.bar').remove();
+    const url = URL.createObjectURL(file);
+    if (file.type.startsWith('image/')) { const img = el('img', 'thumb'); img.src = url; it.body.prepend(img); }
+    else if (file.type.startsWith('video/')) { const v = el('video', 'thumb'); v.src = url; v.controls = true; v.muted = true; it.body.prepend(v); }
+    const a = el('a', 'btn sm primary', 'Save'); a.href = url; a.download = file.name; it.acts.append(a);
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      const s = el('button', 'btn sm', 'Share'); s.onclick = () => navigator.share({ files: [file] }).catch(() => {}); it.acts.append(s);
+    }
+    return a;
+  }
+
+  function finishOutgoing(id) { const it = items[id]; if (!it) return; it.li.querySelector('.bar').remove(); it.acts.append(el('span', 'done', 'Sent ✓')); }
+
+  global.QRUI = { $, el, addTextItem, addFileItem, progress, finishIncoming, finishOutgoing };
+})(window);
+</script>
+<script>
+const { $, addTextItem, addFileItem, progress, finishIncoming, finishOutgoing } = QRUI;
+const target = decodeURIComponent(location.hash.slice(1));
+let xfer, conn, peer;
+function setStatus(t, c) { const s = $('#status'); s.textContent = t; s.className = 'status ' + (c || ''); }
+function clearEmpty() { const e = document.querySelector('#list .empty'); if (e) e.remove(); }
+function setEnabled(on) { document.querySelectorAll('button, label.btn, input, textarea').forEach((e) => e.toggleAttribute('disabled', !on)); }
+
+function connect() {
+  if (!target) { setStatus('No session. Scan the QR code from your computer', 'off'); setEnabled(false); return; }
+  setEnabled(false);
+  if (!peer || peer.destroyed) {
+    peer = new Peer({ debug: 0 });
+    peer.on('error', (e) => {
+      if (e.type === 'peer-unavailable') { setStatus('Computer session ended. Scan a new QR', 'off'); return; }
+      setStatus('Connection problem, retrying…', 'off'); try { peer.destroy(); } catch {} setTimeout(connect, 3000);
+    });
+  }
+  const go = () => {
+    setStatus('Connecting to computer…');
+    conn = peer.connect(target, { reliable: true });
+    conn.on('open', () => {
+      setStatus('Connected', 'on'); setEnabled(true);
+      xfer = QRDrop.makeTransfer(conn, {
+        onText: (t) => { clearEmpty(); addTextItem($('#list'), t, 'in'); },
+        onFileStart: (m) => { clearEmpty(); addFileItem($('#list'), m.id, m, 'in'); },
+        onProgress: progress,
+        onFile: (file, id) => finishIncoming(id, file),
+      });
+    });
+    conn.on('close', () => { xfer = null; setEnabled(false); setStatus('Disconnected, retrying…', 'off'); setTimeout(connect, 2000); });
+  };
+  if (peer.open) go(); else peer.once('open', go);
+}
+
+function sendFiles(list) {
+  if (!xfer) return; clearEmpty();
+  for (const f of [...list]) {
+    let added = false;
+    xfer.sendFile(f, (id, p) => {
+      if (!added) { addFileItem($('#list'), id, f, 'out'); added = true; }
+      progress(id, p); if (p >= 1) finishOutgoing(id);
+    });
+  }
+}
+$('#media').onchange = (e) => { sendFiles(e.target.files); e.target.value = ''; };
+$('#files').onchange = (e) => { sendFiles(e.target.files); e.target.value = ''; };
+$('#sendText').onclick = () => {
+  const t = $('#text').value.trim(); if (!t || !xfer) return;
+  xfer.sendText(t); clearEmpty(); addTextItem($('#list'), t, 'out'); $('#text').value = '';
+};
+// Stop the phone from sleeping mid-transfer where supported
+if ('wakeLock' in navigator) { const lock = () => navigator.wakeLock.request('screen').catch(() => {}); lock(); document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && lock()); }
+connect();
+</script>
+</body></html>
